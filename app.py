@@ -50,6 +50,19 @@ SHAPE_SCORE_MAP = {
     "不整形":          0.00,
 }
 
+# 間取り → 居室数（モデルの学習値に合わせる）
+MADORI_MAP = {
+    "1R / 1K":   1,
+    "1DK":       1,
+    "1LDK":      1,
+    "2K / 2DK":  2,
+    "2LDK":      2,
+    "3DK":       3,
+    "3LDK":      3,
+    "4LDK":      4,
+    "5LDK以上":  5,
+}
+
 SWEEP_MANSION = [
     ("面積（㎡）",               [20, 30, 40, 50, 60, 70, 80, 100]),
     ("築年数",                   [0, 5, 10, 15, 20, 25, 30, 40]),
@@ -277,7 +290,8 @@ with st.sidebar:
         area   = st.slider("専有面積（㎡）",   20,  150, 60, 5)
         age    = st.slider("築年数（年）",       0,   50, 10, 1)
         dist_m = st.slider("最寄駅 徒歩（分）", 1,   30,  7,  1)
-        rooms  = st.selectbox("居室数", [1, 2, 3, 4, 5], index=1)
+        madori = st.selectbox("間取り", list(MADORI_MAP.keys()), index=4)
+        rooms  = MADORI_MAP[madori]
         struct = st.selectbox("建物の構造", ["RC", "SRC", "鉄骨造", "木造"])
     else:
         land   = st.slider("土地面積（㎡）",    30,  400, 100, 5)
