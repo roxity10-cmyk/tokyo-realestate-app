@@ -42,6 +42,22 @@ SCENARIOS = {
     "複合ストレス": {"USDJPY": 170, "JGB10Y": 3.0, "JGB2Y": 1.5,  "建材_前年比": 10.0, "日経平均": 22000},
 }
 
+# 23区 重心座標
+WARD_COORDS = {
+    "千代田区": (35.6942, 139.7536), "中央区":   (35.6706, 139.7728),
+    "港区":     (35.6581, 139.7514), "新宿区":   (35.6938, 139.7034),
+    "文京区":   (35.7077, 139.7518), "台東区":   (35.7126, 139.7803),
+    "墨田区":   (35.7101, 139.8014), "江東区":   (35.6734, 139.8170),
+    "品川区":   (35.6090, 139.7302), "目黒区":   (35.6414, 139.6985),
+    "大田区":   (35.5614, 139.7161), "世田谷区": (35.6464, 139.6536),
+    "渋谷区":   (35.6640, 139.6982), "中野区":   (35.7075, 139.6640),
+    "杉並区":   (35.6994, 139.6366), "豊島区":   (35.7282, 139.7177),
+    "北区":     (35.7528, 139.7336), "荒川区":   (35.7361, 139.7826),
+    "板橋区":   (35.7508, 139.7097), "練馬区":   (35.7358, 139.6516),
+    "足立区":   (35.7751, 139.8046), "葛飾区":   (35.7474, 139.8469),
+    "江戸川区": (35.7064, 139.8687),
+}
+
 SHAPE_SCORE_MAP = {
     "長方形 / 正方形": 1.00,
     "ほぼ長方形":      0.90,
@@ -367,7 +383,7 @@ result  = predict(base_params, art, booster, prop_type)
 tot     = result["総額_万円"]
 
 # ── タブ ─────────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["📊 推定結果", "📈 感度分析", "🔮 シナリオ比較"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 推定結果", "📈 感度分析", "🔮 シナリオ比較", "🗺️ 23区マップ"])
 
 # ══ Tab1: 推定結果 ════════════════════════════════════════════════
 with tab1:
@@ -604,5 +620,124 @@ with tab3:
     st.dataframe(
         disp[["シナリオ", "USDJPY", "JGB10Y", "建材_前年比", "日経平均", "総額(万円)", "変化率"]]
         .set_index("シナリオ"),
+        use_container_width=True,
+    )
+
+# ══ Tab4: 23区マップ ══════════════════════════════════════════════
+with tab4:
+    st.subheader("23区 推定価格マップ")
+    st.caption("サイドバーの条件を各区に適用した推定価格を地図上に表示。東京駅からの距離は区の重心から自動計算。")
+
+    # ── 各区の予測 ────────────────────────────────────────────────
+    known_classes = set(art["encoders"]["市区町村名"].classes_)
+    map_rows = []
+    for ward_name, (lat, lon) in WARD_COORDS.items():
+        if ward_name not in known_classes:
+            continue
+        dist = _haversine(*_TOKYO_ST, lat, lon)
+        p = {**base_params,
+             "市区町村名": ward_name,
+             "東京駅までの直線距離(km)": round(dist, 2)}
+        # 距離依存フラグをリセットしてapply_flagsで再計算させる
+        for flag in ["都心フラグ", "東京駅5km以内", "東京駅15km以内"]:
+            p.pop(flag, None)
+        p.update(get_ward_pop(ward_name, art))
+        r = predict(p, art, booster, prop_type)
+        map_rows.append({
+            "区":       ward_name,
+            "lat":      lat,
+            "lon":      lon,
+            "距離(km)": round(dist, 1),
+            "総額_万円":    round(r["総額_万円"]),
+            "単価_万円/㎡": round(r.get("単価_万円/㎡", r["総額_万円"] / base_params.get("面積（㎡）", 60)), 1),
+        })
+
+    df_map = pd.DataFrame(map_rows).sort_values("距離(km)")
+    price_col   = "単価_万円/㎡" if prop_type == "mansion" else "総額_万円"
+    price_label = "万円/㎡"      if prop_type == "mansion" else "総額(万円)"
+
+    # ── 距離リング生成 ────────────────────────────────────────────
+    def _ring(radius_km: float, n: int = 120):
+        clat, clon = _TOKYO_ST
+        lats, lons = [], []
+        for i in range(n + 1):
+            a = 2 * math.pi * i / n
+            lats.append(clat + math.degrees(radius_km / 6371.0) * math.sin(a))
+            lons.append(clon + math.degrees(radius_km / (6371.0 * math.cos(math.radians(clat)))) * math.cos(a))
+        return lats, lons
+
+    fig_map = go.Figure()
+
+    # 距離リング（5・10・15・20km）
+    for r_km in [5, 10, 15, 20]:
+        rlat, rlon = _ring(r_km)
+        fig_map.add_trace(go.Scattermapbox(
+            lat=rlat, lon=rlon, mode="lines",
+            line=dict(width=1, color="rgba(80,80,80,0.30)"),
+            hoverinfo="none", showlegend=False,
+        ))
+        fig_map.add_trace(go.Scattermapbox(
+            lat=[rlat[30]], lon=[rlon[30]],
+            mode="text", text=[f"{r_km}km"],
+            textfont=dict(size=10, color="gray"),
+            hoverinfo="none", showlegend=False,
+        ))
+
+    # 東京駅マーカー
+    fig_map.add_trace(go.Scattermapbox(
+        lat=[_TOKYO_ST[0]], lon=[_TOKYO_ST[1]],
+        mode="markers+text",
+        marker=dict(size=14, color="black"),
+        text=["🚉 東京駅"], textposition="top right",
+        textfont=dict(size=11, color="black"),
+        hovertext=["東京駅"], hoverinfo="text",
+        showlegend=False,
+    ))
+
+    # 区バブル
+    hover_texts = [
+        f"<b>{row['区']}</b><br>"
+        f"東京駅から {row['距離(km)']} km<br>"
+        f"推定総額: {row['総額_万円']:,} 万円<br>"
+        f"㎡単価: {row['単価_万円/㎡']:,.1f} 万円/㎡"
+        for _, row in df_map.iterrows()
+    ]
+    fig_map.add_trace(go.Scattermapbox(
+        lat=df_map["lat"],
+        lon=df_map["lon"],
+        mode="markers+text",
+        marker=dict(
+            size=28,
+            color=df_map[price_col],
+            colorscale="RdYlGn_r",
+            showscale=True,
+            colorbar=dict(title=price_label, thickness=14),
+            opacity=0.82,
+        ),
+        text=df_map["区"].str.replace("区", "", regex=False),
+        textfont=dict(size=9, color="white"),
+        hovertext=hover_texts,
+        hoverinfo="text",
+        showlegend=False,
+    ))
+
+    fig_map.update_layout(
+        mapbox=dict(
+            style="open-street-map",
+            center=dict(lat=35.685, lon=139.730),
+            zoom=10.3,
+        ),
+        height=640,
+        margin=dict(l=0, r=0, t=0, b=0),
+    )
+    st.plotly_chart(fig_map, use_container_width=True)
+
+    # ── 区別テーブル ──────────────────────────────────────────────
+    st.subheader("区別 推定価格一覧（東京駅距離順）")
+    tbl = df_map[["区", "距離(km)", "総額_万円", "単価_万円/㎡"]].copy()
+    tbl["総額(万円)"] = tbl["総額_万円"].apply(lambda x: f"{x:,}")
+    tbl["㎡単価"]     = tbl["単価_万円/㎡"].apply(lambda x: f"{x:,.1f}")
+    st.dataframe(
+        tbl[["区", "距離(km)", "総額(万円)", "㎡単価"]].set_index("区"),
         use_container_width=True,
     )
