@@ -197,10 +197,12 @@ _OVERPASS_ENDPOINTS = [
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_stations_23wards() -> tuple[pd.DataFrame, str]:
-    """Overpass API で23区内の鉄道駅を取得（キャッシュ24時間）。(df, error_msg) を返す"""
+    """Overpass API で東京都内の鉄道駅を取得（キャッシュ24時間）。(df, error_msg) を返す"""
+    # area フィルターで東京都（admin_level=4）に絞る → 川崎市・浦安市を自動排除
     query = (
-        "[out:json][timeout:30];\n"
-        "node[\"railway\"=\"station\"](35.50,139.50,35.85,139.95);\n"
+        "[out:json][timeout:35];\n"
+        "area[\"name\"=\"東京都\"][\"admin_level\"=\"4\"]->.pref;\n"
+        "node[\"railway\"=\"station\"](area.pref)(35.53,139.55,35.82,139.92);\n"
         "out body;"
     )
     last_err = ""
