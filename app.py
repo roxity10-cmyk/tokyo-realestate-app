@@ -189,6 +189,56 @@ def geocode_station(name: str) -> tuple[float, float] | None:
     return None
 
 
+@st.cache_data(ttl=86400, show_spinner="鉄道駅データを取得中...")
+def fetch_stations_23wards() -> pd.DataFrame:
+    """Overpass API で23区内の鉄道駅を取得（node/way/relation 全タイプ、キャッシュ24時間）"""
+    query = """
+[out:json][timeout:45];
+(
+  node["railway"="station"](35.50,139.50,35.85,139.95);
+  way["railway"="station"](35.50,139.50,35.85,139.95);
+  relation["railway"="station"](35.50,139.50,35.85,139.95);
+  node["public_transport"="station"](35.50,139.50,35.85,139.95);
+  way["public_transport"="station"](35.50,139.50,35.85,139.95);
+);
+out center;
+"""
+    try:
+        r = requests.post(
+            "https://overpass-api.de/api/interpreter",
+            data={"data": query},
+            headers={"User-Agent": "tokyo-realestate-app/1.0"},
+            timeout=60,
+        )
+        rows = []
+        for e in r.json().get("elements", []):
+            tags = e.get("tags", {})
+            name = tags.get("name:ja") or tags.get("name", "")
+            if not name:
+                continue
+            # wayやrelationはcenterキーに座標が入る
+            if e["type"] == "node":
+                lat, lon = e["lat"], e["lon"]
+            elif "center" in e:
+                lat, lon = e["center"]["lat"], e["center"]["lon"]
+            else:
+                continue
+            rows.append({"駅名": name, "lat": lat, "lon": lon})
+        if not rows:
+            return pd.DataFrame(columns=["駅名", "lat", "lon"])
+        df = pd.DataFrame(rows)
+        # 同名駅は最初の出現を残す（通常は最も代表的なnodeが先に来る）
+        df = df.drop_duplicates("駅名").reset_index(drop=True)
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["駅名", "lat", "lon"])
+
+
+def _nearest_ward(lat: float, lon: float) -> str:
+    """最近傍の区を返す"""
+    return min(WARD_COORDS, key=lambda w: _haversine(lat, lon, *WARD_COORDS[w]))
+
+
 def station_to_dist(name: str) -> float | None:
     """駅名 → 東京駅からの直線距離(km)。失敗時はNone"""
     coords = geocode_station(name.strip())
@@ -625,36 +675,16 @@ with tab3:
 
 # ══ Tab4: 23区マップ ══════════════════════════════════════════════
 with tab4:
-    st.subheader("23区 推定価格マップ")
-    st.caption("サイドバーの条件を各区に適用した推定価格を地図上に表示。東京駅からの距離は区の重心から自動計算。")
+    st.subheader("23区 推定価格マップ（主要駅）")
 
-    # ── 各区の予測 ────────────────────────────────────────────────
-    known_classes = set(art["encoders"]["市区町村名"].classes_)
-    map_rows = []
-    for ward_name, (lat, lon) in WARD_COORDS.items():
-        if ward_name not in known_classes:
-            continue
-        dist = _haversine(*_TOKYO_ST, lat, lon)
-        p = {**base_params,
-             "市区町村名": ward_name,
-             "東京駅までの直線距離(km)": round(dist, 2)}
-        # 距離依存フラグをリセットしてapply_flagsで再計算させる
-        for flag in ["都心フラグ", "東京駅5km以内", "東京駅15km以内"]:
-            p.pop(flag, None)
-        p.update(get_ward_pop(ward_name, art))
-        r = predict(p, art, booster, prop_type)
-        map_rows.append({
-            "区":       ward_name,
-            "lat":      lat,
-            "lon":      lon,
-            "距離(km)": round(dist, 1),
-            "総額_万円":    round(r["総額_万円"]),
-            "単価_万円/㎡": round(r.get("単価_万円/㎡", r["総額_万円"] / base_params.get("面積（㎡）", 60)), 1),
-        })
-
-    df_map = pd.DataFrame(map_rows).sort_values("距離(km)")
-    price_col   = "単価_万円/㎡" if prop_type == "mansion" else "総額_万円"
-    price_label = "万円/㎡"      if prop_type == "mansion" else "総額(万円)"
+    # ── コントロール ──────────────────────────────────────────────
+    ctrl1, ctrl2, ctrl3 = st.columns([3, 1, 1])
+    with ctrl1:
+        zoom_level = st.slider("ズームレベル", 9.0, 13.0, 10.5, 0.5, label_visibility="collapsed")
+    with ctrl2:
+        st.caption(f"🔍 ズーム: {zoom_level}")
+    with ctrl3:
+        show_rings = st.toggle("距離リング", value=True)
 
     # ── 距離リング生成 ────────────────────────────────────────────
     def _ring(radius_km: float, n: int = 120):
@@ -666,78 +696,155 @@ with tab4:
             lons.append(clon + math.degrees(radius_km / (6371.0 * math.cos(math.radians(clat)))) * math.cos(a))
         return lats, lons
 
-    fig_map = go.Figure()
+    # ── 駅データ取得 ─────────────────────────────────────────────
+    df_st = fetch_stations_23wards()
 
-    # 距離リング（5・10・15・20km）
-    for r_km in [5, 10, 15, 20]:
-        rlat, rlon = _ring(r_km)
+    if df_st.empty:
+        st.warning("駅データの取得に失敗しました。時間をおいて再試行してください。")
+    else:
+        st.caption(f"取得駅数: {len(df_st)} 駅 ｜ サイドバー条件で各駅の推定価格を算出")
+
+        # ── 各駅の予測（バッチ処理） ────────────────────────────────
+        known_classes = set(art["encoders"]["市区町村名"].classes_)
+
+        # 駅ごとにパラメータ行を生成
+        prep_rows = []
+        for _, st_row in df_st.iterrows():
+            lat, lon = st_row["lat"], st_row["lon"]
+            ward     = _nearest_ward(lat, lon)
+            if ward not in known_classes:
+                continue
+            dist = _haversine(*_TOKYO_ST, lat, lon)
+            p = {**base_params,
+                 "市区町村名":               ward,
+                 "東京駅までの直線距離(km)": round(dist, 2),
+                 "最寄駅：距離（分）":       1}
+            for flag in ["都心フラグ", "東京駅5km以内", "東京駅15km以内",
+                         "徒歩5分以内", "徒歩10分超"]:
+                p.pop(flag, None)
+            p.update(get_ward_pop(ward, art))
+            prep_rows.append({
+                "_名前": st_row["駅名"], "_lat": lat, "_lon": lon,
+                "_区": ward, "_dist": round(dist, 1),
+                **apply_flags(p, art, prop_type),
+            })
+
+        # DataFrameをまとめて構築してバッチ予測
+        map_rows = []
+        if prep_rows:
+            meta_cols = ["_名前", "_lat", "_lon", "_区", "_dist"]
+            batch_params = [{k: v for k, v in row.items() if k not in meta_cols}
+                            for row in prep_rows]
+            feat_rows = []
+            for p in batch_params:
+                row_d = {}
+                for col in art["all_num_features"]:
+                    row_d[col] = float(p.get(col, art["num_medians"][col]))
+                for col in art["cat_features"]:
+                    val = str(p.get(col, art["cat_modes"][col]))
+                    le  = art["encoders"][col]
+                    row_d[col] = (le.transform([val])[0] if val in le.classes_
+                                  else le.transform([art["cat_modes"][col]])[0])
+                feat_rows.append(row_d)
+            df_feat = pd.DataFrame(feat_rows, columns=art["feature_cols"])
+            arr = art["imputer"].transform(df_feat)
+            preds_raw = booster.predict(arr)
+
+            area_val = float(base_params.get("面積（㎡）", art["num_medians"].get("面積（㎡）", 60)))
+            for i, row in enumerate(prep_rows):
+                raw = float(preds_raw[i])
+                if prop_type == "mansion":
+                    total = raw * area_val
+                    unit  = raw
+                else:
+                    total = float(np.expm1(raw))
+                    unit  = total / area_val
+                map_rows.append({
+                    "駅名":       row["_名前"],
+                    "lat":        row["_lat"],
+                    "lon":        row["_lon"],
+                    "区":         row["_区"],
+                    "距離(km)":   row["_dist"],
+                    "総額_万円":    round(total),
+                    "単価_万円/㎡": round(unit, 1),
+                })
+
+        df_map = pd.DataFrame(map_rows).sort_values("距離(km)")
+        price_col   = "単価_万円/㎡" if prop_type == "mansion" else "総額_万円"
+        price_label = "万円/㎡"      if prop_type == "mansion" else "総額(万円)"
+
+        # ── 地図描画 ─────────────────────────────────────────────
+        fig_map = go.Figure()
+
+        # 距離リング（5・10・15・20km）
+        if show_rings:
+            for r_km in [5, 10, 15, 20]:
+                rlat, rlon = _ring(r_km)
+                fig_map.add_trace(go.Scattermapbox(
+                    lat=rlat, lon=rlon, mode="lines",
+                    line=dict(width=1, color="rgba(80,80,80,0.30)"),
+                    hoverinfo="none", showlegend=False,
+                ))
+                fig_map.add_trace(go.Scattermapbox(
+                    lat=[rlat[15]], lon=[rlon[15]],
+                    mode="text", text=[f"{r_km}km"],
+                    textfont=dict(size=10, color="gray"),
+                    hoverinfo="none", showlegend=False,
+                ))
+
+        # 東京駅マーカー
         fig_map.add_trace(go.Scattermapbox(
-            lat=rlat, lon=rlon, mode="lines",
-            line=dict(width=1, color="rgba(80,80,80,0.30)"),
-            hoverinfo="none", showlegend=False,
+            lat=[_TOKYO_ST[0]], lon=[_TOKYO_ST[1]],
+            mode="markers+text",
+            marker=dict(size=14, color="black"),
+            text=["🚉 東京駅"], textposition="top right",
+            textfont=dict(size=11, color="black"),
+            hovertext=["東京駅"], hoverinfo="text",
+            showlegend=False,
         ))
+
+        # 駅バブル
+        hover_texts = [
+            f"<b>{row['駅名']}</b>（{row['区']}）<br>"
+            f"東京駅から {row['距離(km)']} km<br>"
+            f"推定総額: {row['総額_万円']:,} 万円<br>"
+            f"㎡単価: {row['単価_万円/㎡']:,.1f} 万円/㎡"
+            for _, row in df_map.iterrows()
+        ]
         fig_map.add_trace(go.Scattermapbox(
-            lat=[rlat[30]], lon=[rlon[30]],
-            mode="text", text=[f"{r_km}km"],
-            textfont=dict(size=10, color="gray"),
-            hoverinfo="none", showlegend=False,
+            lat=df_map["lat"],
+            lon=df_map["lon"],
+            mode="markers",
+            marker=dict(
+                size=11,
+                color=df_map[price_col],
+                colorscale="RdYlGn_r",
+                showscale=True,
+                colorbar=dict(title=price_label, thickness=14),
+                opacity=0.85,
+            ),
+            hovertext=hover_texts,
+            hoverinfo="text",
+            showlegend=False,
         ))
 
-    # 東京駅マーカー
-    fig_map.add_trace(go.Scattermapbox(
-        lat=[_TOKYO_ST[0]], lon=[_TOKYO_ST[1]],
-        mode="markers+text",
-        marker=dict(size=14, color="black"),
-        text=["🚉 東京駅"], textposition="top right",
-        textfont=dict(size=11, color="black"),
-        hovertext=["東京駅"], hoverinfo="text",
-        showlegend=False,
-    ))
+        fig_map.update_layout(
+            mapbox=dict(
+                style="open-street-map",
+                center=dict(lat=35.685, lon=139.730),
+                zoom=zoom_level,
+            ),
+            height=660,
+            margin=dict(l=0, r=0, t=0, b=0),
+        )
+        st.plotly_chart(fig_map, use_container_width=True)
 
-    # 区バブル
-    hover_texts = [
-        f"<b>{row['区']}</b><br>"
-        f"東京駅から {row['距離(km)']} km<br>"
-        f"推定総額: {row['総額_万円']:,} 万円<br>"
-        f"㎡単価: {row['単価_万円/㎡']:,.1f} 万円/㎡"
-        for _, row in df_map.iterrows()
-    ]
-    fig_map.add_trace(go.Scattermapbox(
-        lat=df_map["lat"],
-        lon=df_map["lon"],
-        mode="markers+text",
-        marker=dict(
-            size=28,
-            color=df_map[price_col],
-            colorscale="RdYlGn_r",
-            showscale=True,
-            colorbar=dict(title=price_label, thickness=14),
-            opacity=0.82,
-        ),
-        text=df_map["区"].str.replace("区", "", regex=False),
-        textfont=dict(size=9, color="white"),
-        hovertext=hover_texts,
-        hoverinfo="text",
-        showlegend=False,
-    ))
-
-    fig_map.update_layout(
-        mapbox=dict(
-            style="open-street-map",
-            center=dict(lat=35.685, lon=139.730),
-            zoom=10.3,
-        ),
-        height=640,
-        margin=dict(l=0, r=0, t=0, b=0),
-    )
-    st.plotly_chart(fig_map, use_container_width=True)
-
-    # ── 区別テーブル ──────────────────────────────────────────────
-    st.subheader("区別 推定価格一覧（東京駅距離順）")
-    tbl = df_map[["区", "距離(km)", "総額_万円", "単価_万円/㎡"]].copy()
-    tbl["総額(万円)"] = tbl["総額_万円"].apply(lambda x: f"{x:,}")
-    tbl["㎡単価"]     = tbl["単価_万円/㎡"].apply(lambda x: f"{x:,.1f}")
-    st.dataframe(
-        tbl[["区", "距離(km)", "総額(万円)", "㎡単価"]].set_index("区"),
-        use_container_width=True,
-    )
+        # ── テーブル ─────────────────────────────────────────────
+        with st.expander("駅別 推定価格一覧（東京駅距離順）"):
+            tbl = df_map[["駅名", "区", "距離(km)", "総額_万円", "単価_万円/㎡"]].copy()
+            tbl["総額(万円)"] = tbl["総額_万円"].apply(lambda x: f"{x:,}")
+            tbl["㎡単価"]     = tbl["単価_万円/㎡"].apply(lambda x: f"{x:,.1f}")
+            st.dataframe(
+                tbl[["駅名", "区", "距離(km)", "総額(万円)", "㎡単価"]].set_index("駅名"),
+                use_container_width=True,
+            )
