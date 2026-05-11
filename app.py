@@ -2,7 +2,7 @@
 東京不動産価格推定 Streamlit アプリ
 マンション / 戸建て を選択して価格推定・感度分析・シナリオ比較
 """
-import os, sys, tempfile, shutil, warnings
+import os, sys, tempfile, shutil, warnings, math
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -129,6 +129,46 @@ def fetch_macro_live() -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════
+# 駅名 → 東京駅距離
+# ══════════════════════════════════════════════════════════════════
+_TOKYO_ST = (35.6812, 139.7671)  # 東京駅
+
+def _haversine(lat1, lon1, lat2, lon2) -> float:
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def geocode_station(name: str) -> tuple[float, float] | None:
+    """駅名 → (lat, lon)  Nominatim (OpenStreetMap) 使用"""
+    query = f"{name}駅 東京都"
+    try:
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": query, "format": "json", "limit": 1, "countrycodes": "jp"},
+            headers={"User-Agent": "tokyo-realestate-app/1.0 (roxity10@gmail.com)"},
+            timeout=10,
+        )
+        data = r.json()
+        if data:
+            return float(data[0]["lat"]), float(data[0]["lon"])
+    except Exception:
+        pass
+    return None
+
+
+def station_to_dist(name: str) -> float | None:
+    """駅名 → 東京駅からの直線距離(km)。失敗時はNone"""
+    coords = geocode_station(name.strip())
+    if coords:
+        return round(_haversine(*_TOKYO_ST, *coords), 1)
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════
 # 予測ヘルパー
 # ══════════════════════════════════════════════════════════════════
 
@@ -234,22 +274,36 @@ with st.sidebar:
     ward = st.selectbox("区", WARD_LIST, index=WARD_LIST.index(default_ward))
 
     if prop_type == "mansion":
-        area   = st.slider("専有面積（㎡）",    20,  150, 60,  5)
-        age    = st.slider("築年数（年）",        0,   50, 10,  1)
-        dist_k = st.slider("東京駅距離（km）",   1.0, 30.0, 8.0, 0.5)
-        dist_m = st.slider("最寄駅 徒歩（分）",  1,   30,  7,   1)
+        area   = st.slider("専有面積（㎡）",   20,  150, 60, 5)
+        age    = st.slider("築年数（年）",       0,   50, 10, 1)
+        dist_m = st.slider("最寄駅 徒歩（分）", 1,   30,  7,  1)
         rooms  = st.selectbox("居室数", [1, 2, 3, 4, 5], index=1)
         struct = st.selectbox("建物の構造", ["RC", "SRC", "鉄骨造", "木造"])
     else:
-        land   = st.slider("土地面積（㎡）",     30,  400, 100, 5)
-        floor  = st.slider("延床面積（㎡）",     30,  400,  95, 5)
-        age    = st.slider("築年数（年）",         0,   50,  10, 1)
-        dist_k = st.slider("東京駅距離（km）",   1.0, 30.0, 13.0, 0.5)
-        dist_m = st.slider("最寄駅 徒歩（分）",  1,   30,   7,   1)
-        road_w = st.slider("前面道路幅員（m）",  2.0, 12.0,  4.0, 0.5)
+        land   = st.slider("土地面積（㎡）",    30,  400, 100, 5)
+        floor  = st.slider("延床面積（㎡）",    30,  400,  95, 5)
+        age    = st.slider("築年数（年）",        0,   50,  10, 1)
+        dist_m = st.slider("最寄駅 徒歩（分）",  1,   30,   7,  1)
+        road_w = st.slider("前面道路幅員（m）", 2.0, 12.0,  4.0, 0.5)
         struct = st.selectbox("建物の構造", ["木造", "鉄骨造", "RC", "SRC"])
         shape_label = st.selectbox("土地の形状", list(SHAPE_SCORE_MAP.keys()))
         shape_score = SHAPE_SCORE_MAP[shape_label]
+
+    # ── 最寄り駅 → 東京駅距離 ──────────────────────────────────────
+    st.divider()
+    _default_km = 8.0 if prop_type == "mansion" else 13.0
+    station_name = st.text_input("最寄り駅名", placeholder="例: 渋谷、吉祥寺、浦安")
+    if station_name.strip():
+        _d = station_to_dist(station_name)
+        if _d is not None:
+            dist_k = _d
+            st.caption(f"📍 {station_name}駅 → 東京駅 **{dist_k:.1f} km**")
+        else:
+            st.warning("駅が見つかりませんでした。手動で入力してください。")
+            dist_k = st.number_input("東京駅 直線距離（km）", 0.5, 50.0, _default_km, 0.5)
+    else:
+        dist_k = st.number_input("東京駅 直線距離（km）", 0.5, 50.0, _default_km, 0.5,
+                                 help="駅名を入力すると自動計算されます")
 
     # ── マクロ条件 ──────────────────────────────────────────────────
     st.header("マクロ条件")
