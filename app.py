@@ -189,49 +189,38 @@ def geocode_station(name: str) -> tuple[float, float] | None:
     return None
 
 
-@st.cache_data(ttl=86400, show_spinner="鉄道駅データを取得中...")
-def fetch_stations_23wards() -> pd.DataFrame:
-    """Overpass API で23区内の鉄道駅を取得（node/way/relation 全タイプ、キャッシュ24時間）"""
-    query = """
-[out:json][timeout:45];
-(
-  node["railway"="station"](35.50,139.50,35.85,139.95);
-  way["railway"="station"](35.50,139.50,35.85,139.95);
-  relation["railway"="station"](35.50,139.50,35.85,139.95);
-  node["public_transport"="station"](35.50,139.50,35.85,139.95);
-  way["public_transport"="station"](35.50,139.50,35.85,139.95);
-);
-out center;
-"""
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_stations_23wards() -> tuple[pd.DataFrame, str]:
+    """Overpass API で23区内の鉄道駅を取得（キャッシュ24時間）。(df, error_msg) を返す"""
+    # node のみのシンプルクエリ → 失敗時は空を返す
+    query = (
+        "[out:json][timeout:30];\n"
+        "node[\"railway\"=\"station\"](35.50,139.50,35.85,139.95);\n"
+        "out body;"
+    )
     try:
         r = requests.post(
             "https://overpass-api.de/api/interpreter",
             data={"data": query},
-            headers={"User-Agent": "tokyo-realestate-app/1.0"},
-            timeout=60,
+            headers={"User-Agent": "tokyo-realestate-app/1.0 (roxity10@gmail.com)"},
+            timeout=40,
         )
+        r.raise_for_status()
+        elements = r.json().get("elements", [])
         rows = []
-        for e in r.json().get("elements", []):
+        for e in elements:
             tags = e.get("tags", {})
             name = tags.get("name:ja") or tags.get("name", "")
-            if not name:
-                continue
-            # wayやrelationはcenterキーに座標が入る
-            if e["type"] == "node":
-                lat, lon = e["lat"], e["lon"]
-            elif "center" in e:
-                lat, lon = e["center"]["lat"], e["center"]["lon"]
-            else:
-                continue
-            rows.append({"駅名": name, "lat": lat, "lon": lon})
+            if name:
+                rows.append({"駅名": name, "lat": e["lat"], "lon": e["lon"]})
         if not rows:
-            return pd.DataFrame(columns=["駅名", "lat", "lon"])
-        df = pd.DataFrame(rows)
-        # 同名駅は最初の出現を残す（通常は最も代表的なnodeが先に来る）
-        df = df.drop_duplicates("駅名").reset_index(drop=True)
-        return df
-    except Exception:
-        return pd.DataFrame(columns=["駅名", "lat", "lon"])
+            return pd.DataFrame(columns=["駅名", "lat", "lon"]), "API は応答しましたが駅データが空でした"
+        df = pd.DataFrame(rows).drop_duplicates("駅名").reset_index(drop=True)
+        return df, ""
+    except requests.exceptions.Timeout:
+        return pd.DataFrame(columns=["駅名", "lat", "lon"]), "Overpass API タイムアウト（サーバー混雑）"
+    except Exception as ex:
+        return pd.DataFrame(columns=["駅名", "lat", "lon"]), str(ex)
 
 
 def _nearest_ward(lat: float, lon: float) -> str:
@@ -697,10 +686,14 @@ with tab4:
         return lats, lons
 
     # ── 駅データ取得 ─────────────────────────────────────────────
-    df_st = fetch_stations_23wards()
+    with st.spinner("鉄道駅データを取得中..."):
+        df_st, fetch_err = fetch_stations_23wards()
 
     if df_st.empty:
-        st.warning("駅データの取得に失敗しました。時間をおいて再試行してください。")
+        st.warning(f"駅データの取得に失敗しました。\n\n原因: {fetch_err}")
+        if st.button("🔄 駅データを再取得", key="retry_stations"):
+            st.cache_data.clear()
+            st.rerun()
     else:
         st.caption(f"取得駅数: {len(df_st)} 駅 ｜ サイドバー条件で各駅の推定価格を算出")
 
