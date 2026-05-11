@@ -2,7 +2,7 @@
 東京不動産価格推定 Streamlit アプリ
 マンション / 戸建て を選択して価格推定・感度分析・シナリオ比較
 """
-import os, sys, tempfile, shutil, warnings, math
+import os, sys, tempfile, shutil, warnings, math, time
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -189,38 +189,48 @@ def geocode_station(name: str) -> tuple[float, float] | None:
     return None
 
 
+_OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.openstreetmap.ru/api/interpreter",
+]
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_stations_23wards() -> tuple[pd.DataFrame, str]:
     """Overpass API で23区内の鉄道駅を取得（キャッシュ24時間）。(df, error_msg) を返す"""
-    # node のみのシンプルクエリ → 失敗時は空を返す
     query = (
         "[out:json][timeout:30];\n"
         "node[\"railway\"=\"station\"](35.50,139.50,35.85,139.95);\n"
         "out body;"
     )
-    try:
-        r = requests.post(
-            "https://overpass-api.de/api/interpreter",
-            data={"data": query},
-            headers={"User-Agent": "tokyo-realestate-app/1.0 (roxity10@gmail.com)"},
-            timeout=40,
-        )
-        r.raise_for_status()
-        elements = r.json().get("elements", [])
-        rows = []
-        for e in elements:
-            tags = e.get("tags", {})
-            name = tags.get("name:ja") or tags.get("name", "")
-            if name:
-                rows.append({"駅名": name, "lat": e["lat"], "lon": e["lon"]})
-        if not rows:
-            return pd.DataFrame(columns=["駅名", "lat", "lon"]), "API は応答しましたが駅データが空でした"
-        df = pd.DataFrame(rows).drop_duplicates("駅名").reset_index(drop=True)
-        return df, ""
-    except requests.exceptions.Timeout:
-        return pd.DataFrame(columns=["駅名", "lat", "lon"]), "Overpass API タイムアウト（サーバー混雑）"
-    except Exception as ex:
-        return pd.DataFrame(columns=["駅名", "lat", "lon"]), str(ex)
+    last_err = ""
+    for attempt, endpoint in enumerate(_OVERPASS_ENDPOINTS):
+        if attempt > 0:
+            time.sleep(2)   # エンドポイント切り替え前に少し待つ
+        try:
+            r = requests.post(
+                endpoint,
+                data={"data": query},
+                headers={"User-Agent": "tokyo-realestate-app/1.0 (roxity10@gmail.com)"},
+                timeout=40,
+            )
+            r.raise_for_status()
+            elements = r.json().get("elements", [])
+            rows = []
+            for e in elements:
+                tags = e.get("tags", {})
+                name = tags.get("name:ja") or tags.get("name", "")
+                if name:
+                    rows.append({"駅名": name, "lat": e["lat"], "lon": e["lon"]})
+            if rows:
+                df = pd.DataFrame(rows).drop_duplicates("駅名").reset_index(drop=True)
+                return df, ""
+            last_err = "API は応答しましたが駅データが空でした"
+        except requests.exceptions.Timeout:
+            last_err = f"タイムアウト ({endpoint})"
+        except Exception as ex:
+            last_err = str(ex)
+    return pd.DataFrame(columns=["駅名", "lat", "lon"]), f"全エンドポイント失敗: {last_err}"
 
 
 def _nearest_ward(lat: float, lon: float) -> str:
